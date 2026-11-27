@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ckanext-aiextract"
-version = "1.0.0"
+version = "1.1.0"
 description = "CKAN extension that extracts text from documents (e.g. PDFs) as input for AI applications"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -68,7 +68,7 @@ known_first_party = ["ckanext"]
 exclude_dirs = ["tests"]
 
 [tool.bumpver]
-current_version = "1.0.0"
+current_version = "1.1.0"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message = "bump version {old_version} -> {new_version}"
 tag_message = "{new_version}"
