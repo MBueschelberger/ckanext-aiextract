@@ -15,7 +15,6 @@ maintainers = [{ name = "Matthias Büschelberger" }]
 keywords = ["CKAN", "ckanext", "AI", "text extraction", "PDF"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
-    "Framework :: CKAN",
     "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
