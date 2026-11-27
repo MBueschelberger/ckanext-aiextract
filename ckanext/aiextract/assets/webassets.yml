@@ -1,0 +1,4 @@
+aiextract:
+  output: aiextract/aiextract.js
+  contents:
+    - aiextract.js
