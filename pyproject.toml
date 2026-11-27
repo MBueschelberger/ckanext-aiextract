@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ckanext-aiextract"
+version = "0.0.0"
+description = "CKAN extension that extracts text from documents (e.g. PDFs) as input for AI applications"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Thomas Hanke", email = "thomas.hanke@iwm.fraunhofer.de" }]
+maintainers = [{ name = "Matthias Büschelberger" }]
+keywords = ["CKAN", "ckanext", "AI", "text extraction", "PDF"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: CKAN",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "ckanapi>=4.7",
+    "requests>=2.31",
+    "sqlalchemy>=1.4,<2",
+    "python-dateutil>=2.8",
+    "urllib3>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-ckan>=0.0.12",
+    "pre-commit>=4.0",
+    "bumpver>=2023.1129",
+    "pip-audit>=2.10.1",
+    "build>=1.2",
+    "twine>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/MBueschelberger/ckanext-aiextract"
+Repository = "https://github.com/MBueschelberger/ckanext-aiextract"
+Issues = "https://github.com/MBueschelberger/ckanext-aiextract/issues"
+
+[project.entry-points."ckan.plugins"]
+aiextract = "ckanext.aiextract.plugin:AiextractPlugin"
+
+[tool.setuptools.packages.find]
+include = ["ckanext", "ckanext.*"]
+
+[tool.setuptools.package-data]
+"ckanext.aiextract" = ["templates/**/*.html", "assets/*.js", "assets/*.yml"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["ckanext"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+
+[tool.bumpver]
+current_version = "0.0.0"
+version_pattern = "MAJOR.MINOR.PATCH"
+commit_message = "bump version {old_version} -> {new_version}"
+tag_message = "{new_version}"
+tag = true
+commit = true
+push = true
+
+[tool.bumpver.file_patterns]
+"pyproject.toml" = ['^version = "{version}"', '^current_version = "{version}"']
+
+[tool.pylint.messages_control]
+disable = [
+    "too-few-public-methods",
+    "duplicate-code",
+    "invalid-name",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
