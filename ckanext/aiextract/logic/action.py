@@ -17,6 +17,7 @@ from dateutil.parser import parse as parse_date
 
 from ckanext.aiextract import backend, db
 from ckanext.aiextract.tasks import update
+from ckanext.aiextract.utils import utcnow
 
 if toolkit.check_ckan_version("2.10"):
     from ckan.types import Context  # pylint: disable=ungrouped-imports
@@ -41,16 +42,71 @@ if not DEFAULT_FORMATS:
 
 log = logging.getLogger(__name__)
 
+# Context flag: the action runs inside the commit of ``model.Session`` (CKAN calls
+# IResourceUrlChange.notify from its before_commit hook). ``model.Session`` must then
+# not be committed again; task_status writes are persisted by the enclosing commit.
+WITHIN_COMMIT = "aiextract_within_commit"
 
-def ready_for_task(context: Context, res_id: str, status: dict) -> bool:
-    """Manage AI embeddings tasks based on their state and timeout.
+TASK_STATUS_COLUMNS = (
+    "entity_id",
+    "entity_type",
+    "task_type",
+    "key",
+    "value",
+    "state",
+    "error",
+    "last_updated",
+)
+
+
+def _save_task_status(task: dict[str, Any], commit: bool = True) -> None:
+    """Insert or overwrite the task_status row of ``task`` using ``model.Session`` only.
+
+    CKAN core ``task_status_update`` reads via ``model.Session`` but writes via
+    ``context["session"]`` and always commits and closes that session, which is unsafe
+    inside a running commit. This writes the row once, in the request's own session, so
+    the request can never wait on a lock held by itself.
 
     Args:
-        context (Context): CKAN Context for authorization and actions.
-        dataset_id (str): The dataset ID for which the task is managed.
+        task (dict): task_status fields; the row is looked up by its unique key
+            (entity_id, task_type, key).
+        commit (bool): Commit ``model.Session`` afterwards. Must be False while
+            ``model.Session`` is committing (the enclosing commit persists the row).
+    """
+    session = model.Session
+    task_status = (
+        session.query(model.TaskStatus)
+        .filter_by(entity_id=task["entity_id"], task_type=task["task_type"], key=task["key"])
+        .first()
+    )
+    if task_status is None:
+        task_status = model.TaskStatus()
+    for column in TASK_STATUS_COLUMNS:
+        if column in task:
+            setattr(task_status, column, task[column])
+    session.add(task_status)
+    if commit:
+        try:
+            session.commit()
+        except sa.exc.SQLAlchemyError:
+            session.rollback()
+            raise
+
+
+def ready_for_task(  # pylint: disable=unused-argument
+    context: Context, res_id: str, status: dict
+) -> bool:
+    """Check whether a new aiextract task may be started for a resource.
+
+    Read-only on ``task_status``: a stale or completed task is not deleted here, it is
+    overwritten by :func:`enqueue_update` (one write per row and request).
+
+    Args:
+        context (Context): CKAN Context (kept for API compatibility).
+        res_id (str): The resource ID the task belongs to.
         status (dict): Status dictionary containing job info.
     Returns:
-        bool: Indicates if the task was successfully managed (started, canceled, or no action).
+        bool: False if a not completed task younger than the job timeout exists, else True.
     """
     try:
         existing_task = toolkit.get_action("task_status_show")(
@@ -65,37 +121,31 @@ def ready_for_task(context: Context, res_id: str, status: dict) -> bool:
         existing_task = None
     log.debug(existing_task)
     assume_task_stale_after = datetime.timedelta(seconds=JOB_TIMEOUT)
-    if existing_task:
-        if existing_task.get("state") != "complete":
-            updated = parse_iso_date(existing_task["last_updated"]).astimezone(
-                datetime.timezone.utc
-            )
-            time_since_last_updated = datetime.datetime.now(datetime.timezone.utc) - updated
+    if existing_task and existing_task.get("state") != "complete":
+        updated = parse_iso_date(existing_task["last_updated"])
+        if updated.tzinfo is None:
+            # task_status.last_updated is stored as naive UTC (see utils.utcnow)
+            updated = updated.replace(tzinfo=datetime.timezone.utc)
+        updated = updated.astimezone(datetime.timezone.utc)
+        time_since_last_updated = datetime.datetime.now(datetime.timezone.utc) - updated
 
-            log.info("%s ?<> %s", time_since_last_updated, assume_task_stale_after)
+        log.info("%s ?<> %s", time_since_last_updated, assume_task_stale_after)
 
-            if time_since_last_updated < assume_task_stale_after:
-                log.info(
-                    "A pending task was found %s, and it is %s old. Limit is %s.",
-                    existing_task["id"],
-                    time_since_last_updated,
-                    assume_task_stale_after,
-                )
-                return False  # pending task not timeouted, not ready
+        if time_since_last_updated < assume_task_stale_after:
             log.info(
-                "An old pending task was found %s for this resource, trying to stop it",
+                "A pending task was found %s, and it is %s old. Limit is %s.",
                 existing_task["id"],
+                time_since_last_updated,
+                assume_task_stale_after,
             )
-            try:
-                toolkit.get_action("task_status_delete")(context, {"id": existing_task["id"]})
-                existing_task = None
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                log.debug("Exception job deletion: %s", e)
-        else:
-            # delete completed jobs
-            toolkit.get_action("task_status_delete")(context, {"id": existing_task["id"]})
-            existing_task = None
-    if status.get("job_id", None) and not existing_task:
+            return False  # pending task not timeouted, not ready
+        log.info(
+            "An old pending task was found %s for this resource, it will be overwritten",
+            existing_task["id"],
+        )
+    # Stale or completed tasks are not deleted (task_status_delete commits model.Session
+    # in the middle of the request); enqueue_update overwrites the row instead.
+    if status.get("job_id", None):
         if db.get_job(status["job_id"]):
             log.debug(
                 "Trying to delete job with id %s from AIembeddings database", status["job_id"]
@@ -128,18 +178,19 @@ def aiextract_delete(context: Context, data_dict: dict[str, Any]) -> dict[str, A
         return False
     res_ids = toolkit.get_or_bust(data_dict, "resource_ids")
     pdf_ressources = [res for res in pkg_dict["resources"] if res["id"] in res_ids]
-    status = toolkit.get_action("aiextract_update_status")(context, {"pdfs": pdf_ressources})
-    pdf_urls = [pdf["url"] for pdf in pdf_ressources]
-    if ready_for_task(context, dataset_id, status):
-        if pdf_urls:
-            for url in pdf_urls:
-                resources = backend.resource_search(
-                    context, dataset_id, first_only=False, hadPrimarySource=url
-                )
-                for resource in resources:
-                    toolkit.get_action("resource_delete")(context, resource)
-        return True
-    return False
+    all_ready = True
+    for pdf in pdf_ressources:
+        status = toolkit.get_action("aiextract_update_status")(context, {"pdfs": [pdf]})
+        if not ready_for_task(context, pdf["id"], status):
+            all_ready = False
+            continue
+        if pdf.get("url"):
+            resources = backend.resource_search(
+                context, dataset_id, first_only=False, hadPrimarySource=pdf["url"]
+            )
+            for resource in resources or []:
+                toolkit.get_action("resource_delete")(context, resource)
+    return all_ready
 
 
 def aiextract_update(context: Context, data_dict: dict[str, Any]) -> dict[str, Any]:
@@ -167,11 +218,13 @@ def aiextract_update(context: Context, data_dict: dict[str, Any]) -> dict[str, A
 
     res_ids = toolkit.get_or_bust(data_dict, "resource_ids")
     pdf_ressources = [res for res in pkg_dict["resources"] if res["id"] in res_ids]
-    status = toolkit.get_action("aiextract_update_status")(context, {"pdfs": pdf_ressources})
+    log.debug("aiextract_update started for dataset: %s and resources: %s", dataset_id, res_ids)
     res = []
-    if ready_for_task(context, dataset_id, status):
-        log.debug("aiextract_update started for dataset: %s and resources: %s", dataset_id, res_ids)
-        for res_id in res_ids:
+    for res_id in res_ids:
+        status = toolkit.get_action("aiextract_update_status")(
+            context, {"pdfs": [r for r in pdf_ressources if r["id"] == res_id]}
+        )
+        if ready_for_task(context, res_id, status):
             res.append(
                 enqueue_update(
                     context,
@@ -181,13 +234,12 @@ def aiextract_update(context: Context, data_dict: dict[str, Any]) -> dict[str, A
                     operation="changed",
                 )
             )
-        log.debug("enqueue job: %s", res)
-        return True
-    return False
+    log.debug("enqueue job: %s", res)
+    return any(res)
 
 
 def enqueue_update(  # pylint: disable=R0913,R0917,R0914
-    context: Context,  # pylint: disable=unused-argument
+    context: Context,
     dataset_url: str,
     dataset_id: str,
     res_id: str,
@@ -195,7 +247,12 @@ def enqueue_update(  # pylint: disable=R0913,R0917,R0914
 ) -> bool:
     """Enquery a Update Task as Background Job
 
+    The task_status row of the resource is written once, via ``model.Session``; an
+    existing (stale or completed) task is overwritten. If ``context[WITHIN_COMMIT]`` is
+    set, ``model.Session`` is not committed here (the enclosing commit persists the row).
+
     Args:
+        context (Context): CKAN context.
         dataset_url (str): Url of the dataset
         dataset_id (str): Dateset Id the ressource is associated with
         res_ids (list): Ids of the ressources to use
@@ -215,7 +272,7 @@ def enqueue_update(  # pylint: disable=R0913,R0917,R0914
         "entity_id": res_id,
         "entity_type": "resource",
         "task_type": "aiextract",
-        "last_updated": str(datetime.datetime.utcnow()),
+        "last_updated": str(utcnow()),
         "state": "submitting",
         "key": "aiextract",
         "value": "{}",
@@ -231,7 +288,7 @@ def enqueue_update(  # pylint: disable=R0913,R0917,R0914
         assume_task_stale_after = datetime.timedelta(seconds=JOB_TIMEOUT)
         if existing_task.get("state") == "pending":
             updated = parse_iso_date(existing_task["last_updated"])
-            time_since_last_updated = datetime.datetime.utcnow() - updated
+            time_since_last_updated = utcnow() - updated
             log.info("%s ?<> %s", time_since_last_updated, assume_task_stale_after)
             if time_since_last_updated > assume_task_stale_after:
                 log.info(
@@ -251,8 +308,9 @@ def enqueue_update(  # pylint: disable=R0913,R0917,R0914
     except toolkit.ObjectNotFound:
         pass
 
-    callback_url = toolkit.url_for(
-        "api.action", ver=3, logic_function="aiextract_hook", qualified=True
+    # ckanext.aiextract.callback_base_url (default: ckan.site_url) + path incl. root_path
+    callback_url = backend.get_ckan_base_url() + toolkit.url_for(
+        "api.action", ver=3, logic_function="aiextract_hook"
     )
 
     # add this dataset to the queue
@@ -280,12 +338,8 @@ def enqueue_update(  # pylint: disable=R0913,R0917,R0914
     value = json.dumps({"job_id": job.id})
     task["value"] = value
     task["state"] = "pending"
-    task["last_updated"] = str(datetime.datetime.utcnow())
-    session = model.meta.create_local_session()
-    try:
-        toolkit.get_action("task_status_update")({"session": session, "ignore_auth": True}, task)
-    finally:
-        session.close()
+    task["last_updated"] = str(utcnow())
+    _save_task_status(task, commit=not context.get(WITHIN_COMMIT))
 
     return True
 
@@ -317,7 +371,7 @@ def aiextract_hook(context: Context, data_dict: dict[str, Any]):
     )
 
     task["state"] = status
-    task["last_updated"] = str(datetime.datetime.utcnow())
+    task["last_updated"] = str(utcnow())
     task["error"] = data_dict.get("error")
     task["task_info"] = job_info
     resubmit = False

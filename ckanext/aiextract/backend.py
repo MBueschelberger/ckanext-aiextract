@@ -14,7 +14,6 @@ from urllib3.util.retry import Retry
 from werkzeug.datastructures import FileStorage
 
 # Configuration constants
-CKAN_URL = os.environ.get("CKAN_SITE_URL", "http://localhost:5000")
 SSL_VERIFY = toolkit.asbool(toolkit.config.get("ckanext.aiextract.ssl_verify", True))
 CHUNK_SIZE = 16 * 1024  # 16kb
 
@@ -64,6 +63,44 @@ def create_session_with_timeout() -> requests.Session:
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
+
+
+def _normalize_base_url(url: str) -> str:
+    """Return ``url`` without trailing slash and with a scheme (``http://`` if missing)."""
+    url = (url or "").strip()
+    if url and not urlparse(url).scheme:
+        url = "http://" + url.lstrip("/")
+    return url.rstrip("/")
+
+
+def get_site_url() -> str:
+    """Return the public CKAN site URL (``ckan.site_url``) without trailing slash."""
+    return _normalize_base_url(toolkit.config.get("ckan.site_url") or "")
+
+
+def get_ckan_base_url() -> str:
+    """Return the base URL background jobs use to reach CKAN.
+
+    ``ckanext.aiextract.callback_base_url`` if set, otherwise ``ckan.site_url``.
+    In Docker setups this can point to the internal CKAN container (e.g.
+    ``http://ckan:5000``) so jobs bypass the public reverse proxy.
+    """
+    base = toolkit.config.get("ckanext.aiextract.callback_base_url") or get_site_url()
+    return _normalize_base_url(base)
+
+
+def to_internal_url(url: str) -> str:
+    """Rewrite a public CKAN URL (``ckan.site_url`` prefix) to the internal base URL.
+
+    URLs not pointing to this CKAN instance are returned unchanged.
+    """
+    site_url = get_site_url()
+    base_url = get_ckan_base_url()
+    if not url or not site_url or site_url == base_url:
+        return url
+    if url == site_url or url.startswith(site_url + "/"):
+        return base_url + url[len(site_url) :]
+    return url
 
 
 @contextmanager
@@ -294,12 +331,13 @@ def extract_text(
         headers = prepare_headers(api_key)
 
         try:
-            # Download resource
+            # Download resource (CKAN-hosted files via the internal base URL)
+            download_url = to_internal_url(resource["url"])
             log.debug("SSL_VERIFY: %s", SSL_VERIFY)
-            log.debug("Downloading resource: %s", resource["url"])
+            log.debug("Downloading resource: %s", download_url)
 
             download_response = session.get(
-                resource["url"], headers=headers, verify=SSL_VERIFY, timeout=timeout
+                download_url, headers=headers, verify=SSL_VERIFY, timeout=timeout
             )
             download_response.raise_for_status()
 
@@ -365,12 +403,12 @@ def download_file(
 
             return filename, content
 
-        # Remote file
+        # Remote file (CKAN-hosted files via the internal base URL)
         with managed_session() as session:
             headers = prepare_headers(api_key)
 
             response = session.get(
-                url,
+                to_internal_url(url),
                 headers=headers,
                 stream=True,
                 verify=SSL_VERIFY,
