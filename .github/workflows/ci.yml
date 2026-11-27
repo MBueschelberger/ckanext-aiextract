@@ -2,13 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["*.*.*"]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "0 8 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   lint:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,8 +25,22 @@ jobs:
 
       - uses: pre-commit/action@v3.0.1
 
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -e . pip-audit
+      - run: pip install --upgrade pip setuptools wheel
+      - run: pip-audit --skip-editable
+
   build:
-    needs: [lint]
+    if: github.event_name != 'schedule'
+    needs: [lint, pip-audit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,7 +1,6 @@
 # ckanext-aiextract
 
 [![CI](https://github.com/MBueschelberger/ckanext-aiextract/actions/workflows/ci.yml/badge.svg)](https://github.com/MBueschelberger/ckanext-aiextract/actions/workflows/ci.yml)
-[![Security](https://github.com/MBueschelberger/ckanext-aiextract/actions/workflows/security.yml/badge.svg)](https://github.com/MBueschelberger/ckanext-aiextract/actions/workflows/security.yml)
 [![PyPI](https://img.shields.io/pypi/v/ckanext-aiextract)](https://pypi.org/project/ckanext-aiextract/)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
