@@ -5,7 +5,6 @@ import re
 import requests
 from ckan.plugins import toolkit
 
-from ckanext.aiextract.backend import get_embedding
 from ckanext.aiextract.logic.action import DEFAULT_FORMATS
 
 
@@ -18,17 +17,6 @@ def aiextract_show_tools(resource):
     """Return True if the resource format matches one of the supported formats."""
     format_parts = re.split("/|;", resource["format"].lower().replace(" ", ""))
     return bool(common_member(format_parts, DEFAULT_FORMATS))
-
-
-def aiextract_artifact_exists(graph_id):
-    """Return the embedding for the given id from the backend."""
-    return get_embedding(graph_id)
-
-
-def aiextract_query_url(pkg_dict):
-    """Return the vector store query URL for the given dataset."""
-    url = f"http://vectorstore.de/#/dataset/{pkg_dict['id']}/query"
-    return url
 
 
 def aiextract_service_available():
@@ -50,6 +38,4 @@ def get_helpers():
     """Return the template helpers provided by this extension."""
     return {
         "aiextract_show_tools": aiextract_show_tools,
-        "aiextract_artifact_exists": aiextract_artifact_exists,
-        "aiextract_query_url": aiextract_query_url,
     }

@@ -5,13 +5,11 @@ import io
 import json
 import logging
 import mimetypes
-import os
 import pathlib
 import re
 import zipfile
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import urlsplit
 
 import ckanapi
 import requests
@@ -22,15 +20,16 @@ from rq import get_current_job
 from urllib3.util.retry import Retry
 
 from ckanext.aiextract import backend, db
+from ckanext.aiextract.utils import utcnow
 
 # Configuration constants
-CKAN_URL = os.environ.get("CKAN_SITE_URL", "http://localhost:5000")
 AIEXTRACT_CKAN_TOKEN = toolkit.config.get("ckanext.aiextract.ckan_token")
 EXTRACT_URL = toolkit.config.get("ckanext.aiextract.extract_url")
 SSL_VERIFY = toolkit.asbool(toolkit.config.get("ckanext.aiextract.ssl_verify", True))
 
 # Timeout configuration
 REQUEST_TIMEOUT = 300  # 5 minutes for individual requests
+CALLBACK_TIMEOUT = 30  # status callbacks to CKAN must fail fast
 EXTRACTION_TIMEOUT = 1800  # 30 minutes for extraction
 UPLOAD_TIMEOUT = 600  # 10 minutes for uploads
 
@@ -78,6 +77,31 @@ def create_session_with_timeout() -> requests.Session:
         total=RETRY_TOTAL,
         backoff_factor=RETRY_BACKOFF_FACTOR,
         status_forcelist=RETRY_STATUS_CODES,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def create_callback_session() -> requests.Session:
+    """
+    Creates a requests Session for status callbacks to CKAN.
+
+    Only a single retry on connection errors; no retries on read timeouts or
+    HTTP error responses (e.g. 504), so a failing callback cannot block the job.
+
+    Returns:
+        requests.Session: Configured session
+    """
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=1,
+        connect=1,
+        read=0,
+        status=0,
+        status_forcelist=[],
+        respect_retry_after_header=False,
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("http://", adapter)
@@ -352,7 +376,7 @@ def initialize_job_data(
         Tuple: metadata dict and job_dict
     """
     metadata = {
-        "ckan_url": CKAN_URL,
+        "ckan_url": backend.get_site_url(),
         "pkg_id": dataset_id,
         "resource_id": res_id,
         "task_created": last_updated,
@@ -421,6 +445,9 @@ def update(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     """
     # Initialize job data
     _, job_dict = initialize_job_data(dataset_url, dataset_id, res_id, last_updated)
+    # Fallback for errors raised before the job logger is set up (e.g. in db.init()),
+    # so the except blocks below never hit an unbound ``logger``.
+    logger = logging.getLogger(__name__)
 
     try:
         job_id = get_current_job().id
@@ -828,15 +855,6 @@ def upload_archive_contents(
 
 
 # Utility functions
-def get_url(action: str) -> str:
-    """Get url for ckan action"""
-    if not urlsplit(CKAN_URL).scheme:
-        ckan_url = "http://" + CKAN_URL.lstrip("/")
-    else:
-        ckan_url = CKAN_URL.rstrip("/")
-    return f"{ckan_url}/api/3/action/{action}"
-
-
 def get_resource(resource_id: str) -> dict[str, Any]:
     """
     Get resource by ID.
@@ -875,14 +893,18 @@ def callback_aiextract_hook(result_url: str, api_key: str, job_dict: dict[str, A
         headers[header] = key
 
     try:
-        session = create_session_with_timeout()
-        result = session.post(
-            result_url,
-            data=json.dumps(job_dict, cls=DatetimeJsonEncoder),
-            verify=SSL_VERIFY,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-        )
+        with create_callback_session() as session:
+            result = session.post(
+                result_url,
+                data=json.dumps(job_dict, cls=DatetimeJsonEncoder),
+                verify=SSL_VERIFY,
+                headers=headers,
+                timeout=CALLBACK_TIMEOUT,
+            )
+        if result.status_code != requests.codes.ok:
+            logging.getLogger().error(
+                "Callback to %s failed with HTTP %s", result_url, result.status_code
+            )
         return result.status_code == requests.codes.ok
 
     except requests.exceptions.RequestException as e:
@@ -905,7 +927,7 @@ class StoringHandler(logging.Handler):
                 conn.execute(
                     db.LOGS_TABLE.insert().values(
                         job_id=self.task_id,
-                        timestamp=datetime.datetime.utcnow(),
+                        timestamp=utcnow(),
                         message=str(record.getMessage()),
                         level=str(record.levelname),
                         module=str(record.module),

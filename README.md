@@ -51,6 +51,13 @@ pip install -e ".[dev]"
 pre-commit install
 ```
 
+Unit tests need CKAN 2.11 installed (`pip install "ckan[requirements]==2.11.*"`), but no
+CKAN config, database, Solr or Redis:
+
+```bash
+pytest
+```
+
 ## Config settings
 
 | Option                          | Default                         | Description |
@@ -61,9 +68,10 @@ pre-commit install
 | `ckanext.aiextract.formats`     | `pdf`                           | Space-separated list of resource formats to process |
 | `ckanext.aiextract.job_timeout` | `1800`                          | Seconds after which a pending task is considered stale |
 | `ckanext.aiextract.ssl_verify`  | `true`                          | Verify TLS certificates for outgoing requests. Set to `false` only for development setups with self-signed certificates |
+| `ckanext.aiextract.callback_base_url` | value of `ckan.site_url`  | Base URL background jobs use to reach CKAN: status callbacks (`aiextract_hook`) and downloads of files hosted by this CKAN. In Docker setups set it to the internal address (e.g. `http://ckan:5000`) so jobs bypass the public reverse proxy / WAF |
 
-Background jobs reach CKAN via the `CKAN_SITE_URL` environment variable
-(default `http://localhost:5000`).
+Status callbacks of a job use a 30 s timeout and are not retried on HTTP errors (e.g. 504);
+a failed callback is logged and the job continues.
 
 In the official CKAN Docker images, every option can also be set as an environment variable using
 the `CKANINI__` prefix, e.g.:
@@ -73,6 +81,37 @@ CKANINI__CKANEXT__AIEXTRACT__EXTRACT_URL=https://extract.example.org/api/extract
 CKANINI__CKANEXT__AIEXTRACT__CKAN_TOKEN=<BACKGROUND_JOBS_API_TOKEN>
 CKANINI__CKANEXT__AIEXTRACT__JOB_TIMEOUT=1800
 CKANINI__CKANEXT__AIEXTRACT__SSL_VERIFY=false   # development only
+CKANINI__CKANEXT__AIEXTRACT__CALLBACK_BASE_URL=http://ckan:5000
+```
+
+## Operations
+
+Versions before 1.1.0 could make a CKAN worker block itself on a `task_status` row lock
+when a PDF was uploaded or updated while an old extraction task existed. Independent of the
+fix, the following safeguards are recommended:
+
+| Measure | Effect |
+| ------- | ------ |
+| uWSGI `harakiri` of a few minutes (e.g. `UWSGI_HARAKIRI=120`) instead of hours | A hanging request is killed after 2 min |
+| More uWSGI capacity, e.g. `-p 4 --threads 4` | A single hanging request no longer blocks the whole instance |
+| PostgreSQL: `ALTER DATABASE <ckan-db> SET idle_in_transaction_session_timeout = '5min';` | Open transactions holding locks are terminated automatically |
+| Docker autoheal (e.g. `willfarrell/autoheal`) or a healthcheck with restart | Docker does not restart `unhealthy` containers on its own |
+
+One-time cleanup of stuck and legacy dataset-level tasks (before or after updating to 1.1.0):
+
+```sql
+-- inspect
+SELECT id, entity_id, entity_type, state, last_updated
+FROM task_status
+WHERE task_type = 'aiextract'
+  AND (entity_type = 'package' OR state IN ('running', 'pending', 'submitting'));
+
+-- delete
+DELETE FROM task_status
+WHERE task_type = 'aiextract'
+  AND (entity_type = 'package'
+       OR (state IN ('running', 'pending', 'submitting')
+           AND last_updated < now() - interval '1 hour'));
 ```
 
 ## Releasing

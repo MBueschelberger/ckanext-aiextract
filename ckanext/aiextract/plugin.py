@@ -75,11 +75,19 @@ class AiextractPlugin(p.SingletonPlugin):
         declaration.declare(group.formats, "pdf")
         declaration.declare(group.extract_url, "")
         declaration.declare(group.job_timeout, 1800)
+        # Base URL background jobs use to reach CKAN (callbacks, downloads of CKAN-hosted
+        # files). Empty means ckan.site_url; e.g. http://ckan:5000 in Docker setups.
+        declaration.declare(group.callback_base_url, "")
 
     # IResourceUrlChange
 
     def notify(self, resource: model.Resource):
-        """Submit a resource to aiextract when its URL changes."""
+        """Submit a resource to aiextract when its URL changes.
+
+        CKAN calls this from the ``before_commit`` hook of ``model.Session``, i.e. while
+        the request's transaction is being committed. The submission must therefore not
+        commit ``model.Session`` itself; its task_status write joins that transaction.
+        """
         context: Context = {"ignore_auth": True}
         resource_dict = p.toolkit.get_action("resource_show")(
             context,
@@ -87,7 +95,7 @@ class AiextractPlugin(p.SingletonPlugin):
                 "id": resource.id,
             },
         )
-        self._sumbit_to_extract(resource_dict)
+        self._sumbit_to_extract(resource_dict, within_commit=True)
 
     # IResourceController
 
@@ -97,14 +105,13 @@ class AiextractPlugin(p.SingletonPlugin):
         """Submit a newly created resource to aiextract."""
         self._sumbit_to_extract(resource_dict)
 
-    def after_update(  # pylint: disable=unused-argument
-        self, context: Context, resource_dict: dict[str, Any]
-    ):
-        """Submit an updated resource to aiextract."""
-        self._sumbit_to_extract(resource_dict)
+    # Updates are handled only via IResourceUrlChange.notify (new file/URL); metadata-only
+    # resource updates intentionally do not trigger a new extraction.
 
-    def _sumbit_to_extract(self, resource_dict: dict[str, Any]):
-        context = {"model": model, "ignore_auth": True, "defer_commit": True}
+    def _sumbit_to_extract(self, resource_dict: dict[str, Any], within_commit: bool = False):
+        context = {"model": model, "ignore_auth": True}
+        if within_commit:
+            context[action.WITHIN_COMMIT] = True
         fmt = resource_dict.get("format", None)
         submit = fmt and fmt.lower() in DEFAULT_FORMATS
         if not submit:

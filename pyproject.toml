@@ -34,7 +34,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "pytest-ckan>=0.0.12",
     "pre-commit>=4.0",
     "bumpver>=2023.1129",
     "pip-audit>=2.10.1",
@@ -89,3 +88,8 @@ disable = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+# The unit tests mock CKAN and need no CKAN config, database, Solr or Redis.
+# Disable CKAN's pytest plugin, which would otherwise try to load a CKAN ini and build the
+# app on session start.
+addopts = "-p no:ckan -p no:ckan_fixtures"
